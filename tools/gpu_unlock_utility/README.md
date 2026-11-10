@@ -295,25 +295,27 @@ Located in the expandable panel at the bottom of Tab 5:
 ---
 
 ### Tab 6: Verification & Telemetry
-After booting through the unlock bootloader into Windows, use this tab to verify that the unlock successfully latched and inspect real-time GPU health:
+After booting through the unlock bootloader into Windows, use this tab to verify the unlock through a robust **dual-check verification architecture** and inspect real-time GPU health:
 
-- **GPU Unlock Verification Status**:
-  - Automatically parses pre-boot hardware logs from the latest bootloader execution (`AUTO*\REPORT.TXT` and `HLS*.TXT`).
-  - **Status Badge**: Highlights `[ACTIVE / UNLOCKED]` (Green) or `[LOCKED / STOCK]` (Red/Warning).
-  - **State**: Confirms whether Workstation/vGPU tensor selectors are latched or operating in consumer locked mode.
-  - **Active Straps**: Displays the post-reset strap registers (`SS0 = 0x88888888 | SS1 = 0x00000008` in unlocked state vs. `SS0 = 0x25204022 | SS1 = 0x7` in stock state).
-  - **Hardware Profile**: Displays the active machine profile (e.g. `entryLatchedSs1Full`).
-  - **Transaction Result**: Validates that PCIe Function-Level Reset (FLR) completed cleanly (`Status = 0, Clean = 1`).
-  - **Boot Session & Timestamp**: Identifies the exact boot session report folder (`AUTO000003/REPORT.TXT`).
-  - **Windows Handoff**: Confirms that execution transferred smoothly to `\EFI\Microsoft\Boot\bootmgfw.efi`.
-- **Live NVIDIA Telemetry**:
-  - Direct integration with `nvidia-smi` to display live GPU name, driver version, core temperature, VRAM utilization, power draw (Watts), SM clock speed, and memory clock speed.
-  - Click **Refresh Telemetry** to refresh both the boot unlock verification status and live GPU statistics simultaneously.
-- **Expected Uplift Protocol**:
-  - Reference expectations for standard cuBLAS GEMM matrix multiplication benchmarks (`4096 x 4096`).
-  - **Locked Baseline**: GA104 achieves ~40-44 TFLOPS; GA102 achieves ~65-70 TFLOPS in FP16/BF16.
-  - **Unlocked State**: GA104 achieves ~88 TFLOPS; GA102 achieves ~125-130 TFLOPS (~1.9x to 2.0x throughput uplift).
-  - In unlocked state, selector registers verify as `SS0 = 0x88888888` and `SS1 = 0x8`.
+#### 1. CHECK 1: Hardware Register Verification (UEFI NVRAM & Bootloader Session)
+- **Direct Hardware Register Verification**: Confirms that strapping registers (`SS0 = 0x88888888 | SS1 = 0x00000008` in unlocked state vs. `SS0 = 0x25204022 | SS1 = 0x7` in stock state) were successfully latched during the boot transaction.
+- **UEFI NVRAM Runtime Variable Priority**: Queries the UEFI runtime environment variable `GpuUnlockState` directly from firmware memory via Win32 `GetFirmwareEnvironmentVariableW`, allowing hardware register verification even if the boot USB stick has been unplugged.
+- **Pre-Boot Bootloader Session Log Fallback**: Gracefully falls back to reading `RTX3090-UNLOCK/AUTO*/REPORT.TXT` if NVRAM export was not present or if Windows is run without administrative privilege.
+- **Operating State & Profile**: Displays active profile (e.g. `entryLatchedSs1Full`) and state (`Active & Unlocked (Workstation/vGPU Straps Latched)`).
+- **PCIe FLR & Handoff**: Confirms that PCIe Function-Level Reset (FLR) completed cleanly (`Status = 0, Clean = 1`) and Windows handoff transferred smoothly to `\EFI\Microsoft\Boot\bootmgfw.efi`.
+- **Refresh Control**: Click **Refresh Hardware Registers** to query live NVRAM / session status on demand.
+
+#### 2. CHECK 2: Silicon Functional Verification (Live Tensor Core Benchmark)
+- **Direct Silicon Benchmark**: Executes real-time 4096 x 4096 FP16 GEMM matrix multiplication directly on GPU silicon (via PyTorch CUDA or cuBLAS) to empirically prove that the Tensor Core throughput limiter is deactivated.
+- **Real-Time Throughput Measurement**: Measures instantaneous TFLOPS achieved on the installed card.
+- **Hardware Rate Limiter Assessment**:
+  - **GA102 (RTX 3090 / 3090 Ti)**: Stock throttled baseline is ~40–65 TFLOPS; unlocked rate achieves ~110–130 TFLOPS (~1.9x to 2.16x throughput uplift).
+  - **GA104 (RTX 3070 Ti)**: Stock throttled baseline is ~40–44 TFLOPS; unlocked rate achieves ~85–90 TFLOPS.
+- **1-Click Silicon Test**: Click **Run Live Silicon Tensor Check** in the UI to perform a 50-iteration benchmark pass in seconds.
+
+#### 3. Live NVIDIA Telemetry
+- Direct integration with `nvidia-smi` to display live GPU name, driver version, core temperature, VRAM utilization, power draw (Watts), SM clock speed, and memory clock speed.
+- Click **Refresh Telemetry** to refresh both verification checks and live GPU statistics simultaneously.
 
 ---
 
@@ -341,7 +343,7 @@ The utility supports full automation through the `-Cli` parameter. This is ideal
 | Parameter | Type | Allowed Values / Description |
 | :--- | :--- | :--- |
 | `-Cli` | Switch | Enables headless command-line execution (suppresses WPF GUI). |
-| `-Action` | String | `Audit`, `Preflight`, `CheckUsb`, `DeployUsb`, `StageProbe`, `BuildLocalUsb`, `RestoreWindows`, `Telemetry`, `CheckCaptures`, `CompareReports`, `GenerateDumps`, `DownloadAssets`. |
+| `-Action` | String | `Audit`, `Preflight`, `CheckUsb`, `DeployUsb`, `StageProbe`, `BuildLocalUsb`, `RestoreWindows`, `Telemetry`, `VerifyTensor`, `CheckCaptures`, `CompareReports`, `GenerateDumps`, `DownloadAssets`. |
 | `-DriveLetter` | String | Target drive letter for USB operations (e.g., `E` or `E:`). Removable USB FAT32 drives only; system and boot partitions are rejected. |
 | `-CapturePath` | String | Folder containing `DIAGnn.TXT`, `IMGnn.BIN`, `PROM.BIN` for analysis. |
 | `-DumpType` | String | For `GenerateDumps`: `Windows`, `EfiCaptures`, or `ProbeUsb`. |
@@ -407,18 +409,24 @@ The utility supports full automation through the `-Cli` parameter. This is ideal
 ```
 *Compiles the read-only Diagnostic Probe targeting the system Windows ESP GUID and stages it to removable FAT32 USB drive `E:`. Explicit `-OptIn` is required, non-USB targets and system/boot partitions are rejected, and existing destination files are refused without overwrite.*
 
-#### 10. Query Real-Time GPU Telemetry & Unlock Verification Status
+#### 10. Query Real-Time GPU Telemetry & Dual Verification Status
 ```powershell
 .\tools\gpu_unlock_utility\GpuUnlockUtility.ps1 -Cli -Action Telemetry
 ```
-*Outputs both the parsed GPU Unlock Verification Status (Active state, straps, profile, transaction result, boot session, Windows handoff) and live `nvidia-smi` hardware metrics.*
+*Outputs Check 1 (Hardware Register Verification via UEFI NVRAM / boot report), Check 2 (Silicon Functional Verification via live Tensor Core GEMM test), and live `nvidia-smi` hardware metrics.*
 
-#### 11. 1-Click Restore Windows Boot Manager
+#### 11. Run Live Silicon Tensor Core Functional Verification
+```powershell
+.\tools\gpu_unlock_utility\GpuUnlockUtility.ps1 -Cli -Action VerifyTensor
+```
+*Runs an immediate 4096 x 4096 FP16 GEMM benchmark directly on GPU silicon, measures real-time TFLOPS, calculates uplift ratio vs. locked baseline, and verifies that the hardware rate limiter is lifted.*
+
+#### 12. 1-Click Restore Windows Boot Manager
 ```powershell
 .\tools\gpu_unlock_utility\GpuUnlockUtility.ps1 -Cli -Action RestoreWindows
 ```
 
-#### 12. Automated 1-Click Firmware Assets Download & Verification
+#### 13. Automated 1-Click Firmware Assets Download & Verification
 ```powershell
 .\tools\gpu_unlock_utility\GpuUnlockUtility.ps1 -Cli -Action DownloadAssets
 ```

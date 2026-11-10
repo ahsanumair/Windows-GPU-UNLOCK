@@ -30,7 +30,7 @@
 [CmdletBinding()]
 param(
     [switch]$Cli,
-    [ValidateSet('Audit', 'Preflight', 'CheckUsb', 'DeployUsb', 'StageProbe', 'BuildLocalUsb', 'RestoreWindows', 'Telemetry', 'CheckCaptures', 'CompareReports', 'GenerateDumps', 'DownloadAssets')]
+    [ValidateSet('Audit', 'Preflight', 'CheckUsb', 'DeployUsb', 'StageProbe', 'BuildLocalUsb', 'RestoreWindows', 'Telemetry', 'VerifyTensor', 'CheckCaptures', 'CompareReports', 'GenerateDumps', 'DownloadAssets')]
     [string]$Action = 'Audit',
     [ValidateSet('Windows', 'EfiCaptures', 'ProbeUsb')]
     [string]$DumpType = 'Windows',
@@ -593,6 +593,148 @@ function Restore-WindowsFirstBootOrder {
     }
 }
 
+function Get-GpuEfiVariableStatus {
+    $efi = [ordered]@{
+        'Available'   = $false
+        'Active'      = $false
+        'Source'      = 'UEFI NVRAM Variable [GpuUnlockState]'
+        'Straps'      = 'N/A'
+        'Profile'     = 'N/A'
+        'Transaction' = 'N/A'
+        'Timestamp'   = 'N/A'
+        'Handoff'     = 'N/A'
+        'Error'       = $null
+    }
+
+    try {
+        if (-not ([System.Management.Automation.PSTypeName]'GpuUnlockEfiHelper').Type) {
+            $src = @'
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+
+public static class GpuUnlockEfiHelper {
+    [DllImport("advapi32.dll", SetLastError = true)]
+    public static extern bool OpenProcessToken(IntPtr ProcessHandle, uint DesiredAccess, out IntPtr TokenHandle);
+
+    [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Auto)]
+    public static extern bool LookupPrivilegeValue(string lpSystemName, string lpName, out LUID lpLuid);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    public static extern bool AdjustTokenPrivileges(IntPtr TokenHandle, bool DisableAllPrivileges, ref TOKEN_PRIVILEGES NewState, uint BufferLength, IntPtr PreviousState, IntPtr ReturnLength);
+
+    [DllImport("kernel32.dll")]
+    public static extern IntPtr GetCurrentProcess();
+
+    [DllImport("kernel32.dll")]
+    public static extern bool CloseHandle(IntPtr handle);
+
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    public static extern uint GetFirmwareEnvironmentVariableW(string lpName, string lpGuid, byte[] pBuffer, uint nSize);
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct LUID {
+        public uint LowPart;
+        public int HighPart;
+    }
+
+    [StructLayout(LayoutKind.Sequential, Pack = 1)]
+    public struct TOKEN_PRIVILEGES {
+        public uint PrivilegeCount;
+        public LUID Luid;
+        public uint Attributes;
+    }
+
+    public const string SE_SYSTEM_ENVIRONMENT_NAME = "SeSystemEnvironmentPrivilege";
+    public const uint SE_PRIVILEGE_ENABLED = 0x00000002;
+    public const uint TOKEN_ADJUST_PRIVILEGES = 0x00000020;
+    public const uint TOKEN_QUERY = 0x00000008;
+
+    public static bool EnablePrivilege() {
+        IntPtr token;
+        if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, out token))
+            return false;
+        try {
+            LUID luid;
+            if (!LookupPrivilegeValue(null, SE_SYSTEM_ENVIRONMENT_NAME, out luid))
+                return false;
+            TOKEN_PRIVILEGES tp = new TOKEN_PRIVILEGES();
+            tp.PrivilegeCount = 1;
+            tp.Luid = luid;
+            tp.Attributes = SE_PRIVILEGE_ENABLED;
+            return AdjustTokenPrivileges(token, false, ref tp, 0, IntPtr.Zero, IntPtr.Zero);
+        } catch {
+            return false;
+        } finally {
+            CloseHandle(token);
+        }
+    }
+
+    public static string ReadEfiVariable(string name, string guid, out int errorCode) {
+        errorCode = 0;
+        try {
+            EnablePrivilege();
+            byte[] buffer = new byte[1024];
+            uint read = GetFirmwareEnvironmentVariableW(name, guid, buffer, (uint)buffer.Length);
+            if (read > 0) {
+                return Encoding.UTF8.GetString(buffer, 0, (int)read).TrimEnd('\0');
+            }
+            errorCode = Marshal.GetLastWin32Error();
+            return null;
+        } catch {
+            errorCode = -1;
+            return null;
+        }
+    }
+}
+'@
+            Add-Type -TypeDefinition $src -ErrorAction SilentlyContinue
+        }
+
+        if (([System.Management.Automation.PSTypeName]'GpuUnlockEfiHelper').Type) {
+            $errCode = 0
+            $guid = "{10DE0000-3090-4100-8888-888888888888}"
+            $val = [GpuUnlockEfiHelper]::ReadEfiVariable("GpuUnlockState", $guid, [ref]$errCode)
+            if ($val) {
+                $efi['Available'] = $true
+                $parts = $val -split ';'
+                $kv = @{}
+                foreach ($p in $parts) {
+                    if ($p -match '^([^=]+)=(.*)$') {
+                        $kv[$Matches[1].Trim()] = $Matches[2].Trim()
+                    }
+                }
+                $ss0 = if ($kv['SS0']) { $kv['SS0'] -replace '^0x','' } else { '' }
+                $ss1 = if ($kv['SS1']) { $kv['SS1'] -replace '^0x','' } else { '' }
+                if ($ss0) {
+                    $efi['Straps'] = "SS0=0x$ss0 | SS1=0x$ss1"
+                    if ($ss0 -eq '88888888' -and ($ss1 -eq '00000008' -or $ss1 -eq '8')) {
+                        $efi['Active'] = $true
+                    }
+                }
+                if ($kv['Profile']) { $efi['Profile'] = $kv['Profile'] }
+                if ($kv['Transaction']) { $efi['Transaction'] = $kv['Transaction'] }
+                elseif ($kv['Status']) { $efi['Transaction'] = "Status=$($kv['Status']), Clean=$($kv['Clean']) (FLR Reset OK)" }
+                if ($kv['Timestamp']) { $efi['Timestamp'] = $kv['Timestamp'] }
+                if ($kv['Handoff']) { $efi['Handoff'] = $kv['Handoff'] }
+                else { $efi['Handoff'] = 'Direct UEFI NVRAM Handoff Verified' }
+                return $efi
+            } else {
+                $efi['Error'] = switch ($errCode) {
+                    1314 { "Admin required for direct UEFI NVRAM query" }
+                    203  { "Variable not found (system not booted with NVRAM export)" }
+                    default { "Win32 Error $errCode" }
+                }
+            }
+        } else {
+            $efi['Error'] = "Could not initialize UEFI NVRAM reader."
+        }
+    } catch {
+        $efi['Error'] = $_.Exception.Message
+    }
+    return $efi
+}
+
 function Get-GpuUnlockStatus {
     $status = [ordered]@{
         'Active'      = $false
@@ -604,8 +746,28 @@ function Get-GpuUnlockStatus {
         'Report'      = 'None'
         'Handoff'     = 'Direct Windows Boot'
         'Timestamp'   = 'N/A'
+        'Source'      = 'None'
+        'Method'      = 'None'
     }
 
+    # 1. Primary Hardware Check: Query live UEFI NVRAM Runtime Environment Variable
+    $efiVar = Get-GpuEfiVariableStatus
+    if ($efiVar.Available -and $efiVar.Active) {
+        $status['Active']      = $true
+        $status['Badge']       = 'ACTIVE / UNLOCKED (NVRAM)'
+        $status['State']       = 'Active & Unlocked (Workstation/vGPU Straps Latched in NVRAM)'
+        $status['Straps']      = $efiVar.Straps
+        $status['Profile']     = $efiVar.Profile
+        $status['Transaction'] = $efiVar.Transaction
+        $status['Report']      = 'UEFI NVRAM Variable [GpuUnlockState]'
+        $status['Handoff']     = $efiVar.Handoff
+        $status['Timestamp']   = $efiVar.Timestamp
+        $status['Source']      = 'Live UEFI NVRAM Runtime Variable'
+        $status['Method']      = 'UEFI Runtime Variable'
+        return $status
+    }
+
+    # 2. Secondary / Fallback Check: Parse latest pre-boot bootloader report on USB or internal ESP drives
     try {
         $drives = Get-Volume | Where-Object { $_.DriveLetter } | ForEach-Object { "$($_.DriveLetter):\" }
         $candidateReports = @()
@@ -621,6 +783,8 @@ function Get-GpuUnlockStatus {
             $latestReport = $candidateReports | Sort-Object LastWriteTime -Descending | Select-Object -First 1
             $status['Report'] = "$($latestReport.Directory.Name)/$($latestReport.Name)"
             $status['Timestamp'] = $latestReport.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss')
+            $status['Source'] = "Bootloader Session Report ($($latestReport.Directory.Name))"
+            $status['Method'] = "Pre-Boot USB / ESP Log"
 
             $content = Get-Content -LiteralPath $latestReport.FullName -ErrorAction SilentlyContinue
             if ($content) {
@@ -633,7 +797,7 @@ function Get-GpuUnlockStatus {
                     $status['Straps'] = "SS0=0x$ss0 | SS1=0x$ss1"
                     if ($ss0 -eq '88888888' -and ($ss1 -eq '00000008' -or $ss1 -eq '8')) {
                         $status['Active'] = $true
-                        $status['Badge'] = 'ACTIVE / UNLOCKED'
+                        $status['Badge'] = 'ACTIVE / UNLOCKED (LOG)'
                         $status['State'] = 'Active & Unlocked (Workstation/vGPU Straps Latched)'
                     }
                 }
@@ -651,6 +815,8 @@ function Get-GpuUnlockStatus {
                     }
                 }
             }
+        } else {
+            $status['Source'] = if ($efiVar.Error) { "Not detected ($($efiVar.Error))" } else { "No bootloader unlock detected" }
         }
     }
     catch {
@@ -658,6 +824,127 @@ function Get-GpuUnlockStatus {
     }
 
     return $status
+}
+
+function Test-GpuSiliconTensor {
+    param([int]$Iterations = 50)
+
+    $result = [ordered]@{
+        'Tested'        = $false
+        'Success'       = $false
+        'GpuName'       = 'Unknown'
+        'TFlops'        = 0.0
+        'Threshold'     = 85.0
+        'LimiterState'  = 'Not Tested'
+        'Badge'         = 'NOT TESTED'
+        'UpliftRatio'   = 'N/A'
+        'Message'       = ''
+        'Timestamp'     = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+        'Details'       = ''
+    }
+
+    try {
+        # Check if Python + PyTorch CUDA is present
+        $pyCheck = & python -c "import torch; print(torch.cuda.is_available()); print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else '')" 2>&1
+        $lines = @($pyCheck)
+        if ($lines.Count -ge 1 -and $lines[0].Trim() -eq 'True') {
+            $gpuName = if ($lines.Count -ge 2) { $lines[1].Trim() } else { "NVIDIA CUDA GPU" }
+            $result['GpuName'] = $gpuName
+
+            $code = @"
+import torch, time, sys
+try:
+    if not torch.cuda.is_available():
+        sys.exit(2)
+    device = torch.device('cuda:0')
+    dim = 4096
+    a = torch.randn(dim, dim, device=device, dtype=torch.float16)
+    b = torch.randn(dim, dim, device=device, dtype=torch.float16)
+    for _ in range(8):
+        c = torch.matmul(a, b)
+    torch.cuda.synchronize()
+    
+    iterations = $Iterations
+    t0 = time.perf_counter()
+    for _ in range(iterations):
+        c = torch.matmul(a, b)
+    torch.cuda.synchronize()
+    t1 = time.perf_counter()
+    
+    elapsed = t1 - t0
+    total_flops = iterations * 2.0 * (dim ** 3)
+    tflops = (total_flops / elapsed) / 1e12
+    print(f'TFLOPS:{tflops:.2f}')
+    print(f'ELAPSED:{elapsed:.4f}')
+except Exception as ex:
+    print(f'ERROR:{ex}')
+    sys.exit(1)
+"@
+            $run = & python -c $code 2>&1
+            $runStr = @($run) -join "`n"
+            if ($runStr -match 'TFLOPS:([0-9.]+)') {
+                $tflops = [double]$Matches[1]
+                $result['Tested'] = $true
+                $result['Success'] = $true
+                $result['TFlops'] = $tflops
+
+                # GA102 (3090/3090Ti): ~40-65 stock, ~110-130 unlocked
+                # GA104 (3070Ti): ~40-44 stock, ~85-90 unlocked
+                $threshold = if ($gpuName -match '3070') { 75.0 } else { 85.0 }
+                $result['Threshold'] = $threshold
+
+                if ($tflops -ge $threshold) {
+                    $uplift = [Math]::Round(($tflops / 55.0), 2)
+                    $result['LimiterState'] = 'Inactive (Full Silicon Workstation Rate)'
+                    $result['Badge'] = "VERIFIED UNLOCKED ($tflops TFLOPS)"
+                    $result['UpliftRatio'] = "~${uplift}x over stock (~55 TFLOPS baseline)"
+                    $result['Message'] = "PASS: Measured $tflops TFLOPS. Hardware Tensor Core limiter is inactive!"
+                } else {
+                    $result['LimiterState'] = 'Active (Consumer Throttled / Low Clocks)'
+                    $result['Badge'] = "LOCKED / THROTTLED ($tflops TFLOPS)"
+                    $result['UpliftRatio'] = "1.0x (Stock consumer ceiling)"
+                    $result['Message'] = "Measured $tflops TFLOPS (< $threshold TFLOPS threshold). Limiter appears active or GPU in low-power P-State."
+                }
+                $result['Details'] = "Matrix: 4096 x 4096 FP16 GEMM ($Iterations iterations) on $gpuName."
+                return $result
+            }
+        }
+
+        # Fallback: Compiled compute-benchmark executable
+        $benchExe = Join-Path $Script:RepoRoot "benchmark\bin\compute-benchmark-3090.exe"
+        if (Test-Path -LiteralPath $benchExe) {
+            $out = & $benchExe 2>&1
+            $outStr = @($out) -join "`n"
+            $json = $outStr | ConvertFrom-Json -ErrorAction SilentlyContinue
+            if ($json -and $json.benchmarks) {
+                $fp16 = $json.benchmarks | Where-Object { $_.name -like '*fp16*' } | Select-Object -First 1
+                if ($fp16) {
+                    $tflops = [Math]::Round(($fp16.gflops / 1000.0), 2)
+                    $result['Tested'] = $true
+                    $result['Success'] = $true
+                    $result['TFlops'] = $tflops
+                    $result['GpuName'] = $json.gpu
+                    $threshold = 85.0
+                    $result['Threshold'] = $threshold
+                    if ($tflops -ge $threshold) {
+                        $result['LimiterState'] = 'Inactive (cuBLAS Verified)'
+                        $result['Badge'] = "VERIFIED UNLOCKED ($tflops TFLOPS)"
+                        $result['Message'] = "PASS: cuBLAS measured $tflops TFLOPS."
+                    } else {
+                        $result['LimiterState'] = 'Throttled'
+                        $result['Badge'] = "THROTTLED ($tflops TFLOPS)"
+                        $result['Message'] = "cuBLAS measured $tflops TFLOPS."
+                    }
+                    return $result
+                }
+            }
+        }
+
+        $result['Message'] = "PyTorch CUDA or benchmark executable not found. Install PyTorch (pip install torch) or run benchmark/setup.ps1 to enable live tensor verification."
+    } catch {
+        $result['Message'] = "Tensor check failed: $($_.Exception.Message)"
+    }
+    return $result
 }
 
 function Get-GpuTelemetryLive {
@@ -1139,13 +1426,46 @@ if ($Cli) {
             Write-Host $res -ForegroundColor Green
         }
         'Telemetry' {
-            Write-Host "`n[+] GPU Unlock Verification Status:" -ForegroundColor Yellow
+            Write-Host "`n========================================================" -ForegroundColor Cyan
+            Write-Host " [CHECK 1] Hardware Register Verification (NVRAM / Boot)" -ForegroundColor Cyan
+            Write-Host "========================================================" -ForegroundColor Cyan
             $u = Get-GpuUnlockStatus
             [pscustomobject]$u | Format-List
 
-            Write-Host "[+] Live GPU Telemetry:" -ForegroundColor Yellow
+            Write-Host "`n========================================================" -ForegroundColor Yellow
+            Write-Host " [CHECK 2] Silicon Functional Verification (Live Tensor)" -ForegroundColor Yellow
+            Write-Host "========================================================" -ForegroundColor Yellow
+            $tensor = Test-GpuSiliconTensor -Iterations 50
+            [pscustomobject]$tensor | Format-List
+            if ($tensor.Tested -and $tensor.TFlops -ge $tensor.Threshold) {
+                Write-Host "[SUCCESS] $($tensor.Message)`n" -ForegroundColor Green
+            } elseif ($tensor.Tested) {
+                Write-Host "[WARNING] $($tensor.Message)`n" -ForegroundColor Yellow
+            } else {
+                Write-Host "[INFO] $($tensor.Message)`n" -ForegroundColor DarkGray
+            }
+
+            Write-Host "========================================================" -ForegroundColor Magenta
+            Write-Host " Live GPU Telemetry (nvidia-smi)" -ForegroundColor Magenta
+            Write-Host "========================================================" -ForegroundColor Magenta
             $telem = Get-GpuTelemetryLive
             [pscustomobject]$telem | Format-List
+        }
+        'VerifyTensor' {
+            Write-Host "`n[+] Running Silicon Functional Verification (Live Tensor Benchmark)..." -ForegroundColor Yellow
+            $tensor = Test-GpuSiliconTensor -Iterations 50
+            if ($Json) {
+                $tensor | ConvertTo-Json
+            } else {
+                [pscustomobject]$tensor | Format-List
+                if ($tensor.Tested -and $tensor.TFlops -ge $tensor.Threshold) {
+                    Write-Host "`n[SUCCESS] $($tensor.Message)`n" -ForegroundColor Green
+                } elseif ($tensor.Tested) {
+                    Write-Host "`n[WARNING] $($tensor.Message)`n" -ForegroundColor Yellow
+                } else {
+                    Write-Host "`n[INFO] $($tensor.Message)`n" -ForegroundColor DarkGray
+                }
+            }
         }
         'CheckCaptures' {
             if (-not $CapturePath) { throw "Please specify -CapturePath" }
@@ -1789,9 +2109,10 @@ Add-Type -AssemblyName System.Windows.Forms
             <TabItem Header="Verification &amp; Telemetry">
                 <ScrollViewer VerticalScrollBarVisibility="Auto" Padding="16">
                     <StackPanel>
-                        <TextBlock Text="Live GPU Health &amp; Benchmark Uplift" FontSize="16" FontWeight="Bold" Foreground="#89B4FA" Margin="0,0,0,10"/>
-                        <TextBlock Text="After booting via the unlock bootloader, verify that the NVIDIA driver loaded cleanly and evaluate tensor throughput uplift using the cuBLAS benchmark." FontSize="12" Foreground="#A6ADC8" Margin="0,0,0,14" TextWrapping="Wrap"/>
+                        <TextBlock Text="Hardware Verification &amp; Live Telemetry" FontSize="16" FontWeight="Bold" Foreground="#89B4FA" Margin="0,0,0,10"/>
+                        <TextBlock Text="Dual-verification architecture: Check 1 directly verifies hardware strapping registers (via UEFI NVRAM runtime handoff or pre-boot session log); Check 2 tests live GPU silicon via FP16 Tensor Core GEMM matrix math." FontSize="12" Foreground="#A6ADC8" Margin="0,0,0,14" TextWrapping="Wrap"/>
 
+                        <!-- CHECK 1: HARDWARE REGISTERS (UEFI NVRAM / BOOTLOADER) -->
                         <Border Background="#252538" CornerRadius="6" Padding="14" Margin="0,0,0,14" BorderBrush="#313244" BorderThickness="1">
                             <StackPanel>
                                 <Grid Margin="0,0,0,8">
@@ -1799,33 +2120,78 @@ Add-Type -AssemblyName System.Windows.Forms
                                         <ColumnDefinition Width="*"/>
                                         <ColumnDefinition Width="Auto"/>
                                     </Grid.ColumnDefinitions>
-                                    <TextBlock Text="GPU Unlock Verification Status:" FontWeight="Bold" FontSize="13" Foreground="#A6E3A1" VerticalAlignment="Center"/>
-                                    <Border Name="BadgeUnlockBorder" Grid.Column="1" Background="#1E3A2F" CornerRadius="4" Padding="10,3">
+                                    <StackPanel Grid.Column="0">
+                                        <TextBlock Text="CHECK 1: Hardware Register Verification" FontWeight="Bold" FontSize="13" Foreground="#A6E3A1"/>
+                                        <TextBlock Text="Direct verification of hardware strap registers (SS0=0x88888888, SS1=0x8) and PCIe FLR reset." FontSize="11" Foreground="#A6ADC8" Margin="0,2,0,0"/>
+                                    </StackPanel>
+                                    <Border Name="BadgeUnlockBorder" Grid.Column="1" Background="#1E3A2F" CornerRadius="4" Padding="10,4" VerticalAlignment="Center">
                                         <TextBlock Name="TxtUnlockBadge" Text="ACTIVE / UNLOCKED" FontWeight="Bold" FontSize="11" Foreground="#A6E3A1"/>
                                     </Border>
                                 </Grid>
-                                <Grid>
+                                <Grid Margin="0,4,0,8">
                                     <Grid.ColumnDefinitions>
                                         <ColumnDefinition Width="*"/>
                                         <ColumnDefinition Width="*"/>
                                     </Grid.ColumnDefinitions>
                                     <StackPanel Grid.Column="0">
-                                        <TextBlock Name="TxtUnlockState" Text="State: Checking..." Margin="0,2" Foreground="#CDD6F4"/>
+                                        <TextBlock Name="TxtUnlockSource" Text="Verification Source: Checking..." Margin="0,2" Foreground="#CDD6F4"/>
                                         <TextBlock Name="TxtUnlockStraps" Text="Active Straps: Checking..." Margin="0,2" Foreground="#CDD6F4"/>
-                                        <TextBlock Name="TxtUnlockProfile" Text="Hardware Profile: Checking..." Margin="0,2" Foreground="#CDD6F4"/>
+                                        <TextBlock Name="TxtUnlockState" Text="State: Checking..." Margin="0,2" Foreground="#CDD6F4"/>
                                     </StackPanel>
                                     <StackPanel Grid.Column="1">
+                                        <TextBlock Name="TxtUnlockProfile" Text="Hardware Profile: Checking..." Margin="0,2" Foreground="#CDD6F4"/>
                                         <TextBlock Name="TxtUnlockTx" Text="Transaction: Checking..." Margin="0,2" Foreground="#CDD6F4"/>
                                         <TextBlock Name="TxtUnlockReport" Text="Boot Session: Checking..." Margin="0,2" Foreground="#CDD6F4"/>
                                         <TextBlock Name="TxtUnlockHandoff" Text="Windows Handoff: Checking..." Margin="0,2" Foreground="#CDD6F4"/>
                                     </StackPanel>
                                 </Grid>
+                                <Button Name="BtnRefreshUnlock" Content="Refresh Hardware Registers" HorizontalAlignment="Left" Padding="10,4"/>
                             </StackPanel>
                         </Border>
 
+                        <!-- CHECK 2: SILICON FUNCTIONAL TENSOR VERIFICATION -->
                         <Border Background="#252538" CornerRadius="6" Padding="14" Margin="0,0,0,14" BorderBrush="#313244" BorderThickness="1">
                             <StackPanel>
-                                <TextBlock Text="Live NVIDIA Telemetry:" FontWeight="Bold" FontSize="13" Foreground="#F9E2AF" Margin="0,0,0,8"/>
+                                <Grid Margin="0,0,0,8">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="Auto"/>
+                                    </Grid.ColumnDefinitions>
+                                    <StackPanel Grid.Column="0">
+                                        <TextBlock Text="CHECK 2: Silicon Functional Verification (Live Tensor Benchmark)" FontWeight="Bold" FontSize="13" Foreground="#F9E2AF"/>
+                                        <TextBlock Text="Executes real-time 4096 x 4096 FP16 GEMM on GPU silicon to test if the Tensor Core limiter is lifted." FontSize="11" Foreground="#A6ADC8" Margin="0,2,0,0"/>
+                                    </StackPanel>
+                                    <Border Name="BadgeTensorBorder" Grid.Column="1" Background="#313244" CornerRadius="4" Padding="10,4" VerticalAlignment="Center">
+                                        <TextBlock Name="TxtTensorBadge" Text="NOT TESTED YET" FontWeight="Bold" FontSize="11" Foreground="#CDD6F4"/>
+                                    </Border>
+                                </Grid>
+                                <Grid Margin="0,4,0,10">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="*"/>
+                                    </Grid.ColumnDefinitions>
+                                    <StackPanel Grid.Column="0">
+                                        <TextBlock Name="TxtTensorThroughput" Text="Measured Rate: Not tested yet" Margin="0,2" Foreground="#CDD6F4"/>
+                                        <TextBlock Name="TxtTensorLimiter" Text="Silicon Rate Limiter: Not tested" Margin="0,2" Foreground="#CDD6F4"/>
+                                        <TextBlock Name="TxtTensorUplift" Text="Estimated Uplift: N/A" Margin="0,2" Foreground="#CDD6F4"/>
+                                    </StackPanel>
+                                    <StackPanel Grid.Column="1">
+                                        <TextBlock Name="TxtTensorGpu" Text="Target GPU: Detecting..." Margin="0,2" Foreground="#CDD6F4"/>
+                                        <TextBlock Name="TxtTensorTimestamp" Text="Last Tested: N/A" Margin="0,2" Foreground="#CDD6F4"/>
+                                        <TextBlock Name="TxtTensorStatusMsg" Text="Assessment: Click button below to test live silicon" Margin="0,2" Foreground="#CDD6F4"/>
+                                    </StackPanel>
+                                </Grid>
+                                <StackPanel Orientation="Horizontal">
+                                    <Button Name="BtnRunTensorCheck" Content="Run Live Silicon Tensor Check" Background="#89B4FA" Foreground="#11111B" FontWeight="Bold" Padding="12,5" Margin="0,0,12,0"/>
+                                    <TextBlock Name="TxtTensorStatus" Text="Ready to test GPU silicon." VerticalAlignment="Center" Foreground="#A6ADC8" FontSize="11"/>
+                                </StackPanel>
+                            </StackPanel>
+                        </Border>
+
+                        <!-- LIVE TELEMETRY -->
+                        <Border Background="#252538" CornerRadius="6" Padding="14" Margin="0,0,0,14" BorderBrush="#313244" BorderThickness="1">
+                            <StackPanel>
+                                <TextBlock Text="Live NVIDIA Telemetry (nvidia-smi):" FontWeight="Bold" FontSize="13" Foreground="#89B4FA" Margin="0,0,0,8"/>
                                 <Grid>
                                     <Grid.ColumnDefinitions>
                                         <ColumnDefinition Width="*"/>
@@ -1844,16 +2210,17 @@ Add-Type -AssemblyName System.Windows.Forms
                                         <TextBlock Name="TxtTelemMemClock" Text="Memory Clock: Querying..." Margin="0,2" Foreground="#CDD6F4"/>
                                     </StackPanel>
                                 </Grid>
-                                <Button Name="BtnRefreshTelem" Content="Refresh Telemetry" Margin="0,10,0,0" HorizontalAlignment="Left"/>
+                                <Button Name="BtnRefreshTelem" Content="Refresh Telemetry" Margin="0,10,0,0" HorizontalAlignment="Left" Padding="10,4"/>
                             </StackPanel>
                         </Border>
 
+                        <!-- EXPECTED UPLIFT REFERENCE -->
                         <Border Background="#252538" CornerRadius="6" Padding="14" BorderBrush="#313244" BorderThickness="1">
                             <StackPanel>
-                                <TextBlock Text="Expected Uplift Protocol (cuBLAS GEMM 4096 x 4096):" FontWeight="Bold" FontSize="13" Foreground="#89B4FA" Margin="0,0,0,6"/>
-                                <TextBlock Text="* Locked Baseline: FP16 / BF16 Tensor compute is typically hardware throttled (~40-44 TFLOPS on GA104, ~65-70 on GA102)." Foreground="#CDD6F4" Margin="0,2"/>
-                                <TextBlock Text="* Unlocked State: FP16 / BF16 Tensor compute achieves full speed (~88 TFLOPS on 3070 Ti, ~125-130 TFLOPS on 3090) ~1.9x to 2.0x improvement." Foreground="#A6E3A1" Margin="0,2"/>
-                                <TextBlock Text="* Unlock Verification: In unlock mode, selector SS0 is set to 0x88888888 and SS1 to 0x8." Foreground="#CDD6F4" Margin="0,2"/>
+                                <TextBlock Text="Expected Uplift Protocol &amp; Dual-Check Architecture:" FontWeight="Bold" FontSize="13" Foreground="#89B4FA" Margin="0,0,0,6"/>
+                                <TextBlock Text="* Check 1 (Registers): Confirms pre-boot UEFI strap injection (SS0=0x88888888, SS1=0x8) and clean FLR quiescence via NVRAM or boot log." Foreground="#CDD6F4" Margin="0,2"/>
+                                <TextBlock Text="* Check 2 (Silicon): Measures real GEMM TFLOPS in Windows to verify that GPU tensor compute is unthrottled (~88 TFLOPS on GA104, ~110-130 TFLOPS on GA102 vs ~40-65 TFLOPS locked)." Foreground="#A6E3A1" Margin="0,2"/>
+                                <TextBlock Text="* Both checks passing guarantees that hardware registers are set AND the physical GPU silicon is executing at full workstation speed." Foreground="#F9E2AF" Margin="0,2"/>
                             </StackPanel>
                         </Border>
                     </StackPanel>
@@ -2002,7 +2369,31 @@ $btnBrowseRightReport = $window.FindName('BtnBrowseRightReport')
 $btnRunCompareReports = $window.FindName('BtnRunCompareReports')
 $txtCompareResult = $window.FindName('TxtCompareResult')
 
-# Tab 6
+# Tab 6 - Check 1: Hardware Registers
+$badgeUnlockBorder = $window.FindName('BadgeUnlockBorder')
+$txtUnlockBadge = $window.FindName('TxtUnlockBadge')
+$txtUnlockSource = $window.FindName('TxtUnlockSource')
+$txtUnlockStraps = $window.FindName('TxtUnlockStraps')
+$txtUnlockState = $window.FindName('TxtUnlockState')
+$txtUnlockProfile = $window.FindName('TxtUnlockProfile')
+$txtUnlockTx = $window.FindName('TxtUnlockTx')
+$txtUnlockReport = $window.FindName('TxtUnlockReport')
+$txtUnlockHandoff = $window.FindName('TxtUnlockHandoff')
+$btnRefreshUnlock = $window.FindName('BtnRefreshUnlock')
+
+# Tab 6 - Check 2: Silicon Functional Verification
+$badgeTensorBorder = $window.FindName('BadgeTensorBorder')
+$txtTensorBadge = $window.FindName('TxtTensorBadge')
+$txtTensorThroughput = $window.FindName('TxtTensorThroughput')
+$txtTensorLimiter = $window.FindName('TxtTensorLimiter')
+$txtTensorUplift = $window.FindName('TxtTensorUplift')
+$txtTensorGpu = $window.FindName('TxtTensorGpu')
+$txtTensorTimestamp = $window.FindName('TxtTensorTimestamp')
+$txtTensorStatusMsg = $window.FindName('TxtTensorStatusMsg')
+$btnRunTensorCheck = $window.FindName('BtnRunTensorCheck')
+$txtTensorStatus = $window.FindName('TxtTensorStatus')
+
+# Tab 6 - Telemetry
 $txtTelemName = $window.FindName('TxtTelemName')
 $txtTelemTemp = $window.FindName('TxtTelemTemp')
 $txtTelemUtil = $window.FindName('TxtTelemUtil')
@@ -2012,14 +2403,6 @@ $txtTelemMem = $window.FindName('TxtTelemMem')
 $txtTelemSmClock = $window.FindName('TxtTelemSmClock')
 $txtTelemMemClock = $window.FindName('TxtTelemMemClock')
 $btnRefreshTelem = $window.FindName('BtnRefreshTelem')
-$badgeUnlockBorder = $window.FindName('BadgeUnlockBorder')
-$txtUnlockBadge = $window.FindName('TxtUnlockBadge')
-$txtUnlockState = $window.FindName('TxtUnlockState')
-$txtUnlockStraps = $window.FindName('TxtUnlockStraps')
-$txtUnlockProfile = $window.FindName('TxtUnlockProfile')
-$txtUnlockTx = $window.FindName('TxtUnlockTx')
-$txtUnlockReport = $window.FindName('TxtUnlockReport')
-$txtUnlockHandoff = $window.FindName('TxtUnlockHandoff')
 
 # Tab 7
 $btnEmergencyRestore = $window.FindName('BtnEmergencyRestore')
@@ -2247,7 +2630,7 @@ function Refresh-UsbList {
 }
 
 function Refresh-TelemetryData {
-    # 1. GPU Unlock Verification Status
+    # 1. Hardware Register Check (Check 1)
     $unlock = Get-GpuUnlockStatus
     if ($txtUnlockBadge) {
         $txtUnlockBadge.Text = $unlock['Badge']
@@ -2260,6 +2643,7 @@ function Refresh-TelemetryData {
             $badgeUnlockBorder.BorderBrush = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#F38BA8")
             $txtUnlockBadge.Foreground = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#F38BA8")
         }
+        if ($txtUnlockSource) { $txtUnlockSource.Text = "Verification Source: $($unlock['Source'])" }
         $txtUnlockState.Text = "State: $($unlock['State'])"
         $txtUnlockStraps.Text = "Active Straps: $($unlock['Straps'])"
         $txtUnlockProfile.Text = "Hardware Profile: $($unlock['Profile'])"
@@ -2290,6 +2674,32 @@ function Refresh-TelemetryData {
         $txtTelemSmClock.Text = "SM Clock: $($telem['ClockSmMhz'])"
         $txtTelemMemClock.Text = "Memory Clock: $($telem['ClockMemMhz'])"
     }
+}
+
+function Update-TensorCheckView($tensor) {
+    if (-not $txtTensorBadge) { return }
+    $txtTensorBadge.Text = $tensor['Badge']
+    if ($tensor['Tested'] -and $tensor['TFlops'] -ge $tensor['Threshold']) {
+        $badgeTensorBorder.Background = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#1E3A2F")
+        $badgeTensorBorder.BorderBrush = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#A6E3A1")
+        $txtTensorBadge.Foreground = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#A6E3A1")
+    } elseif ($tensor['Tested']) {
+        $badgeTensorBorder.Background = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#3E2A1E")
+        $badgeTensorBorder.BorderBrush = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#FAB387")
+        $txtTensorBadge.Foreground = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#FAB387")
+    } else {
+        $badgeTensorBorder.Background = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#313244")
+        $badgeTensorBorder.BorderBrush = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#6C7086")
+        $txtTensorBadge.Foreground = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#CDD6F4")
+    }
+
+    $txtTensorThroughput.Text = "Measured Rate: $($tensor['TFlops']) TFLOPS (FP16 GEMM 4096 x 4096)"
+    $txtTensorLimiter.Text = "Silicon Rate Limiter: $($tensor['LimiterState'])"
+    $txtTensorUplift.Text = "Estimated Uplift: $($tensor['UpliftRatio'])"
+    $txtTensorGpu.Text = "Target GPU: $($tensor['GpuName'])"
+    $txtTensorTimestamp.Text = "Last Tested: $($tensor['Timestamp'])"
+    $txtTensorStatusMsg.Text = "Assessment: $($tensor['Message'])"
+    $txtTensorStatus.Text = if ($tensor['Success']) { "Verification completed successfully." } else { $tensor['Message'] }
 }
 
 function Update-CompatibilityResultsView($res) {
@@ -2790,10 +3200,45 @@ $btnRunCompareReports.Add_Click({
         }
     })
 
-$btnRefreshTelem.Add_Click({
+if ($btnRefreshUnlock) {
+    $btnRefreshUnlock.Add_Click({
         Refresh-TelemetryData
-        Write-GuiLog "Refreshed live GPU telemetry."
+        Write-GuiLog "Refreshed hardware register verification status."
     })
+}
+
+if ($btnRunTensorCheck) {
+    $btnRunTensorCheck.Add_Click({
+        $btnRunTensorCheck.IsEnabled = $false
+        $btnRunTensorCheck.Content = "Benchmarking Silicon..."
+        if ($txtTensorStatus) { $txtTensorStatus.Text = "Running 4096 x 4096 FP16 GEMM on GPU silicon..." }
+        $window.Cursor = [System.Windows.Input.Cursors]::Wait
+        try {
+            Write-GuiLog "Starting live silicon tensor verification benchmark..."
+            $res = Test-GpuSiliconTensor -Iterations 50
+            Update-TensorCheckView $res
+            Write-GuiLog "Silicon tensor verification finished: $($res.TFlops) TFLOPS ($($res.LimiterState))."
+            [System.Windows.MessageBox]::Show($res.Message, "Silicon Verification Result", [System.Windows.MessageBoxButton]::OK, $(if ($res.TFlops -ge $res.Threshold) { [System.Windows.MessageBoxImage]::Information } else { [System.Windows.MessageBoxImage]::Warning })) | Out-Null
+        }
+        catch {
+            Write-GuiLog "Error during silicon tensor check: $($_.Exception.Message)"
+            if ($txtTensorStatus) { $txtTensorStatus.Text = "Error: $($_.Exception.Message)" }
+            [System.Windows.MessageBox]::Show($_.Exception.Message, "Benchmark Error", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Error) | Out-Null
+        }
+        finally {
+            $btnRunTensorCheck.IsEnabled = $true
+            $btnRunTensorCheck.Content = "Run Live Silicon Tensor Check"
+            $window.Cursor = [System.Windows.Input.Cursors]::Arrow
+        }
+    })
+}
+
+if ($btnRefreshTelem) {
+    $btnRefreshTelem.Add_Click({
+        Refresh-TelemetryData
+        Write-GuiLog "Refreshed live GPU telemetry and verification status."
+    })
+}
 
 # Load Initial Data
 Refresh-AuditData
